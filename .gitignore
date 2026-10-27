@@ -10,3 +10,6 @@ dist/
 coverage/
 .DS_Store
 Thumbs.db
+
+# Local-only handover notes — never pushed
+HANDOVER.md
