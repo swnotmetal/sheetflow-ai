@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.data/
+*.sqlite
+*.log
+*.tmp
+coverage/
+.DS_Store
+Thumbs.db
