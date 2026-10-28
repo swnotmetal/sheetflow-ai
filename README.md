@@ -8,6 +8,17 @@ you do.
 Sibling of [`langorder-ai`](https://github.com/swnotmetal/langorder-ai) (enterprise, LangGraph +
 ERPNext). Same safety story, no new infrastructure: the spreadsheet is the database and the UI.
 
+## Who this is for
+
+High-volume, low-to-mid-ticket, repeatable orders — the cheap, bulky, "same thing every week" kind.
+The higher the ticket, the more the salesperson, never a machine, should sit between the customer
+and the deal. What sheetflow actually replaces is the person in the middle who copies rows by hand
+between Outlook and the warehouse sheet — not the salesperson.
+
+Non-English and complex product text is the highest-risk axis for hallucination, so the rule stays
+"copy exactly, never paraphrase, drop anything not literally in the mail" (`groundFacts`) rather
+than trusting the model's structured output.
+
 ## The loop
 
 ```mermaid
