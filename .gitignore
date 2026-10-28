@@ -11,5 +11,15 @@ coverage/
 .DS_Store
 Thumbs.db
 
+# Workbook safety nets and scratch copies
+*.bak
+*.xlsx.tmp
+
+# A working copy of the user's workbook (see README: copy the sample here)
+/orders.xlsx
+
 # Local-only handover notes — never pushed
 HANDOVER.md
+
+# Miko local session state
+.miko/state/

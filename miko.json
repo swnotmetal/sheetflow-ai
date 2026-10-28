@@ -1,0 +1,35 @@
+{
+  "$schema": "./node_modules/koma-miko/schema/miko.schema.json",
+  "version": 1,
+  "specs": [
+    {
+      "id": "sheetflow-write-safety",
+      "appliesWhen": {
+        "action": {
+          "tools": [
+            "create_file",
+            "replace_string_in_file",
+            "multi_replace_string_in_file",
+            "apply_patch",
+            "editFiles",
+            "Edit",
+            "Write"
+          ],
+          "pathPrefixes": [
+            "src/workflow.ts",
+            "src/extract.ts",
+            "src/model.ts",
+            "src/excel.ts",
+            "src/mail.ts",
+            "src/outbound.ts",
+            "src/db.ts"
+          ]
+        }
+      },
+      "requires": {
+        "skills": [{ "name": "sheetflow-review", "reloadAfterCompaction": true }]
+      },
+      "mode": "enforce"
+    }
+  ]
+}
