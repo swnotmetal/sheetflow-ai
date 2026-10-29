@@ -1,5 +1,7 @@
 # sheetflow-ai
 
+**Turns order emails into filled-in Excel rows. You approve. No data entry.**
+
 A customer emails an order. sheetflow reads the mail, works out which rows of **your own Excel
 file** it is talking about, drafts the quantity into those rows, and then stops and waits. You
 decide by typing `OK` or `no` in the sheet you were already looking at. Nothing is applied until
