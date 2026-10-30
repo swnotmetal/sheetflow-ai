@@ -11,14 +11,14 @@
     "dev": "tsx src/cli.ts",
     "inbox": "tsx src/cli.ts inbox",
     "test": "tsx --test test/*.test.ts",
-    "test:live": "tsx test/live.aws.ts"
+    "test:live": "tsx test/live.aws.ts",
+    "build": "node tools/build.mjs"
   },
   "dependencies": {
     "@ai-sdk/amazon-bedrock": "^5.0.125",
     "@aws-sdk/credential-provider-node": "^3.972.89",
     "@mastra/core": "^1.0.0",
     "@mastra/libsql": "^1.27.0",
-    "better-sqlite3": "^13.0.3",
     "exceljs": "^4.4.0",
     "imapflow": "^2.9.1",
     "mailparser": "^3.12.4",
@@ -26,8 +26,8 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^26.6.5",
+    "esbuild": "^0.28.2",
     "koma-miko": "^0.1.0-alpha.14",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"

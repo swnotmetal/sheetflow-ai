@@ -61,14 +61,23 @@ export const EXTRACT_SYSTEM = [
 /**
  * The catalogue comes from the sender's own workbook, so the model can point at a row we actually
  * have — and `src/excel.ts` still verifies every SKU it returns. A guessed SKU never becomes a row.
+ *
+ * A workbook with no SKU column is listed by product name only, and the instruction changes with
+ * it: there is nothing for the model to copy into `sku`, so it must quote the name verbatim.
  */
 export function catalogueBlock(products: { sku: string; name: string }[]): string {
   if (products.length === 0) return '';
+  const withSku = products.some((product) => product.sku.trim() !== '');
   return [
-    'When an item is one of these, copy its `sku` exactly. Never invent a SKU.',
+    withSku
+      ? 'When an item is one of these, copy its `sku` exactly. Never invent a SKU.'
+      : 'This workbook has no SKU column. When an item is one of these, copy its name into ' +
+        '`description` exactly as written, and leave `sku` out.',
     'If nothing here matches what the sender asked for, leave `sku` out — that is a normal answer.',
-    'CATALOGUE (sku | product name):',
-    ...products.map((product) => `- ${product.sku} | ${product.name}`),
+    withSku ? 'CATALOGUE (sku | product name):' : 'CATALOGUE (product name):',
+    ...products.map((product) =>
+      product.sku.trim() ? `- ${product.sku} | ${product.name}` : `- ${product.name}`,
+    ),
   ].join('\n');
 }
 

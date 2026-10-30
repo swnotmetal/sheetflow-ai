@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { resolveModelConfig } from '@mastra/core/llm';
-import { EXTRACT_SCHEMA, PROFILES, resolveProfile, type Extraction } from '../src/model.js';
+import { EXTRACT_SCHEMA, PROFILES, catalogueBlock, resolveProfile, type Extraction } from '../src/model.js';
 import {
   ExtractionInvalidError,
   ExtractionUnavailableError,
@@ -213,4 +213,26 @@ test('intent must be one of the three labels — never an invented one', () => {
   assert.equal(EXTRACT_SCHEMA.safeParse({ intent: 'other', lines: [] }).success, true);
   assert.equal(EXTRACT_SCHEMA.safeParse({ intent: 'purchase', lines: [] }).success, false);
   assert.equal(EXTRACT_SCHEMA.safeParse({ lines: [] }).success, false, 'intent is required');
+});
+
+test('the catalogue asks for a SKU only when the workbook has one', () => {
+  const skus = catalogueBlock([
+    { sku: 'AP-TSH-BLK-M', name: 'Oversized Tee' },
+    { sku: 'ACC-SOC-BLK-OS', name: 'Ribbed Socks' },
+  ]);
+  assert.match(skus, /copy its `sku` exactly/);
+  assert.match(skus, /- AP-TSH-BLK-M \| Oversized Tee/);
+
+  // A shop that keeps names only: nothing to copy into `sku`, so the name becomes the key, verbatim.
+  const names = catalogueBlock([
+    { sku: '', name: 'Oversized Tee' },
+    { sku: '', name: 'Ribbed Socks' },
+  ]);
+  assert.match(names, /no SKU column/);
+  assert.match(names, /copy its name into `description` exactly/);
+  assert.match(names, /^CATALOGUE \(product name\):$/m);
+  assert.match(names, /^- Oversized Tee$/m);
+  assert.doesNotMatch(names, /\|/, 'no empty SKU column to confuse the model');
+
+  assert.equal(catalogueBlock([]), '', 'no catalogue is better than an empty heading');
 });

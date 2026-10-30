@@ -23,3 +23,7 @@ HANDOVER.md
 
 # Miko local session state
 .miko/state/
+
+# Build output: the packaged executable and its native sidecar
+dist/
+.build/

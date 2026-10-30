@@ -1,21 +1,28 @@
 // The pipeline test: mail -> extract -> SKU rows -> AI_Draft -> human mark in the sheet.
 //
-// Deterministic by construction — the model is a mock, the workbook is memory. What is *not*
-// mocked is the graph: real Mastra steps, real suspend/resume, real approval reading.
+// Deterministic by construction — the model is a mock, the workbook is memory, except for one test
+// that runs the real `.xlsx` client because the shape it covers (a sheet with no SKU column) is a
+// property of the file, not of the graph. What is *not* mocked is the graph: real Mastra steps, real
+// suspend/resume, real approval reading.
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Mastra } from '@mastra/core';
 import { InMemoryStore } from '@mastra/core/storage';
-import { buildWorkflow, decideIntent, formatDraft, groundText } from '../src/workflow.js';
+import ExcelJS from 'exceljs';
+import { buildWorkflow, decideIntent, formatDraft, groundText, mailSource } from '../src/workflow.js';
 import { resolveProfile, type Extraction } from '../src/model.js';
-import type { Workbook } from '../src/excel.js';
+import { fileWorkbook, type Workbook } from '../src/excel.js';
 
 const MAIL = {
   messageId: '<MSG-1@acer.example>',
   from: 'orders@acer.example',
   subject: 'PO 4500 — restock request',
   body: 'Please ship 30 units of steel bracket to our depot in Rotterdam.',
+  receivedAt: '2026-10-30T07:12:34.000Z',
 };
 
 const EXTRACTION: Extraction = {
@@ -32,6 +39,7 @@ interface FakeSheet {
 
 function memoryBook({ rows: sheet = { 'steel bracket': 4 } }: FakeSheet = {}) {
   const drafts = new Map<number, string>();
+  const notes = new Map<number, string | undefined>();
   const review = new Map<number, 'approved' | 'rejected' | 'pending'>();
   const cleared: number[] = [];
   const results = new Map<number, string>();
@@ -54,6 +62,7 @@ function memoryBook({ rows: sheet = { 'steel bracket': 4 } }: FakeSheet = {}) {
     },
     async writeDraft(value, cell) {
       drafts.set(cell.row, value);
+      notes.set(cell.row, cell.note);
     },
     async readApproval(row) {
       return review.get(row) ?? 'pending';
@@ -76,7 +85,7 @@ function memoryBook({ rows: sheet = { 'steel bracket': 4 } }: FakeSheet = {}) {
     },
   };
 
-  return { book, drafts, review, cleared, results, log };
+  return { book, drafts, notes, review, cleared, results, log };
 }
 
 function harness(extraction: Extraction = EXTRACTION, sheet: FakeSheet = {}) {
@@ -99,7 +108,7 @@ test('the row comes from the sheet, not from the caller', async () => {
   const first = await run.start({ inputData: MAIL });
 
   assert.equal(first.status, 'suspended');
-  assert.deepEqual([...drafts.entries()], [[4, '30']], 'drafted into the row the SKU lives in');
+  assert.deepEqual([...drafts.entries()], [[4, '30 · steel bracket']], 'drafted into the row the SKU lives in');
 });
 
 test('a line the sheet has no row for is reported, never written', async () => {
@@ -126,7 +135,7 @@ test('a line with no quantity is drafted as `?` — a guessed number is never wr
 
   await run.start({ inputData: MAIL });
 
-  assert.deepEqual([...drafts.values()], ['?']);
+  assert.deepEqual([...drafts.values()], ['? · steel bracket']);
 });
 
 test('a quantity in the text wins over a model that called it a question', async () => {
@@ -140,7 +149,7 @@ test('a quantity in the text wins over a model that called it a question', async
 
   // Nova Lite called three plainly-quantified orders "question" while these fixtures were being
   // written; believing it would silently drop real orders.
-  assert.deepEqual([...drafts.values()], ['30']);
+  assert.deepEqual([...drafts.values()], ['30 · steel bracket']);
 });
 
 test('"do you have any black crew socks?" still reaches the sheet', async () => {
@@ -154,7 +163,7 @@ test('"do you have any black crew socks?" still reaches the sheet', async () => 
 
   // A bare availability question is not ours to interpret: the human sees the row and answers.
   assert.equal(first.status, 'suspended');
-  assert.deepEqual([...drafts.values()], ['?']);
+  assert.deepEqual([...drafts.values()], ['? · steel bracket']);
 });
 
 test('a vendor pitch is not drafted either', async () => {
@@ -195,7 +204,7 @@ test('the human answers; the answer arrives as the resume payload', async () => 
   if (resumed.status !== 'success') assert.fail(`expected success, got ${resumed.status}`);
   assert.deepEqual(resumed.result.approved, [4]);
   assert.deepEqual(resumed.result.pending, []);
-  assert.equal(drafts.get(4), '30', 'an approval leaves the draft in place for the human to act on');
+  assert.equal(drafts.get(4), '30 · steel bracket', 'an approval leaves the draft in place for the human to act on');
 });
 
 test('a rejection is recorded; the draft is cleared later, by the write-back', async () => {
@@ -207,7 +216,7 @@ test('a rejection is recorded; the draft is cleared later, by the write-back', a
 
   if (resumed.status !== 'success') assert.fail(`expected success, got ${resumed.status}`);
   assert.deepEqual(resumed.result.rejected, [4]);
-  assert.equal(drafts.get(4), '30', 'the graph only decides; the driver does the clearing');
+  assert.equal(drafts.get(4), '30 · steel bracket', 'the graph only decides; the driver does the clearing');
 });
 
 test('an untouched row stays pending — silence is not consent', async () => {
@@ -256,11 +265,93 @@ test('a failed extraction fails the run instead of drafting an empty row', async
   assert.equal(result.status, 'failed');
 });
 
-test('formatDraft keeps the human-facing value readable', () => {
-  assert.equal(formatDraft([{ description: 'steel bracket', quantity: '30' }]), '30 steel bracket');
+test('a sheet with only product names gets a draft on the right row', async () => {
+  // The real client on purpose: "no SKU column" is a property of the file, and the catalogue handed
+  // to the model changes with it. A shop that keeps names only must not fail on the first mail.
+  const dir = await mkdtemp(join(tmpdir(), 'sheetflow-nameonly-'));
+  const path = join(dir, 'stock.xlsx');
+  const seed = new ExcelJS.Workbook();
+  const sheet = seed.addWorksheet('Stock');
+  sheet.addRow(['Product Name', 'Qty']);
+  sheet.addRow(['Ribbed Athletic Crew Socks - Black', 5]);
+  await seed.xlsx.writeFile(path);
+
+  let shown: { sku: string; name: string }[] = [];
+  const workflow = buildWorkflow({
+    mastra: new Mastra({ storage: new InMemoryStore() }),
+    book: fileWorkbook(path),
+    extract: async (target) => {
+      shown = target.catalogue ?? [];
+      return {
+        intent: 'order',
+        lines: [{ description: 'Ribbed Athletic Crew Socks - Black', quantity: '12' }],
+      };
+    },
+    provider: resolveProfile('openai'),
+  });
+
+  const run = await workflow.createRun();
+  const result = await run.start({
+    inputData: {
+      ...MAIL,
+      // Grounding: a line the mail does not literally mention never reaches the sheet.
+      body: 'Please send 12 of Ribbed Athletic Crew Socks - Black to our depot.',
+    },
+  });
+
+  assert.equal(result.status, 'suspended');
+  assert.deepEqual(
+    shown,
+    [{ sku: '', name: 'Ribbed Athletic Crew Socks - Black' }],
+    'the model is told about the sheet by name, with no SKU to invent',
+  );
+
+  const after = new ExcelJS.Workbook();
+  await after.xlsx.readFile(path);
+  assert.equal(after.worksheets[0].getCell('C2').value, '12 · Ribbed Athletic Crew Socks - Black');
+  assert.equal(after.worksheets[0].getCell('A2').value, 'Ribbed Athletic Crew Socks - Black');
+});
+
+test('formatDraft keeps the mail and the amount readable side by side', () => {
+  assert.equal(
+    formatDraft([{ description: 'steel bracket', quantity: '30' }]),
+    '30 · steel bracket',
+    'the human compares the mail wording with the amount in one cell',
+  );
   assert.equal(
     formatDraft([{ description: 'steel bracket', quantity: '2', unit: 'box' }]),
-    '2 box steel bracket',
+    '2 box · steel bracket',
+  );
+  assert.equal(
+    formatDraft([{ description: 'black crew socks' }]),
+    '? · black crew socks',
+    'no quantity is `?`, and the item is still named',
   );
   assert.equal(formatDraft([]), '');
+});
+
+test('the note stays readable when the mail has no sender or no subject', () => {
+  assert.equal(
+    mailSource({ from: '', subject: 'Re: restock', receivedAt: '' }),
+    '"Re: restock"',
+    'a subject alone is still an alignment a human can make',
+  );
+  assert.equal(
+    mailSource({ from: 'shop@example.com', subject: '', receivedAt: '2026-10-30T07:12:34Z' }),
+    '2026-10-30 07:12 UTC · shop@example.com',
+  );
+  assert.equal(mailSource({ from: '', subject: '', receivedAt: '' }), '');
+});
+
+test('the suggestion carries the mail that asked for it', async () => {
+  const { workflow, notes } = harness();
+  const run = await workflow.createRun();
+
+  await run.start({ inputData: MAIL });
+
+  assert.equal(
+    notes.get(4),
+    '2026-10-30 07:12 UTC · orders@acer.example — "PO 4500 — restock request"',
+    'when, who, and the subject — on the row, not in a separate window',
+  );
 });

@@ -10,7 +10,7 @@ import { copyFile, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import ExcelJS from 'exceljs';
-import { fileWorkbook, isSheetBusy, parseDecision } from '../src/excel.js';
+import { cellTextValue, fileWorkbook, isSheetBusy, parseDecision } from '../src/excel.js';
 
 const SOURCE = 'test/inventory.xlsx';
 
@@ -18,6 +18,16 @@ async function scratchCopy() {
   const dir = await mkdtemp(join(tmpdir(), 'sheetflow-'));
   const path = join(dir, 'inventory.xlsx');
   await copyFile(SOURCE, path);
+  return path;
+}
+
+/** A throwaway workbook built to order, for the shapes the sample does not have. */
+async function buildWorkbook(fill: (wb: ExcelJS.Workbook) => void) {
+  const wb = new ExcelJS.Workbook();
+  fill(wb);
+  const dir = await mkdtemp(join(tmpdir(), 'sheetflow-'));
+  const path = join(dir, 'workbook.xlsx');
+  await wb.xlsx.writeFile(path);
   return path;
 }
 
@@ -36,6 +46,12 @@ async function readSheet(path: string) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(path);
   return wb.worksheets[0];
+}
+
+async function readSheetNamed(path: string, name: string) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(path);
+  return wb.getWorksheet(name);
 }
 
 /** `solid` is the highlight that means "this row is asking for an answer"; anything else means quiet. */
@@ -266,6 +282,226 @@ test('the sample sheet is exactly as it was before any of this', async () => {
   await wb.xlsx.readFile(SOURCE);
   assert.equal(wb.worksheets[0].columnCount, 11);
   assert.equal(wb.worksheets[0].getCell('L1').value, null);
+});
+
+test('the suggestion carries the mail that asked for it, as a note', async () => {
+  const path = await scratchCopy();
+  const wb = fileWorkbook(path);
+  const first = '2026-10-30 09:12 UTC · orders@acme.example — "Re: restock"';
+
+  await wb.writeDraft('30 · Oversized Heavyweight Tee - Black - M', { row: 2, note: first });
+
+  const sheet = await readSheet(path);
+  assert.equal(sheet.getCell('L2').note, first, 'when, who and the subject sit on the row');
+  assert.equal(sheet.getCell('A2').note, undefined, 'business cells are not annotated');
+
+  // A second mail on the same row must not leave the first sender behind.
+  await wb.writeDraft('45 · Oversized Heavyweight Tee - Black - M', { row: 2, note: 'second mail' });
+  assert.equal((await readSheet(path)).getCell('L2').note, 'second mail');
+
+  // Rejecting returns the row to plain stock data: the provenance goes with the suggestion.
+  await wb.clearDraft(2);
+  const cleared = await readSheet(path);
+  assert.equal(cleared.getCell('L2').value, null);
+  assert.equal(cleared.getCell('L2').note, undefined);
+});
+
+test('a workbook with no SKU column is matched by product name', async () => {
+  const path = await buildWorkbook((wb) => {
+    const ws = wb.addWorksheet('Stock');
+    ws.addRow(['Product Name', 'Qty']);
+    ws.addRow(['Oversized Heavyweight Tee - Black - M', 10]);
+    ws.addRow(['Ribbed Athletic Crew Socks - Black', 5]);
+  });
+  const book = fileWorkbook(path);
+
+  assert.deepEqual(await book.products(), [
+    { sku: '', name: 'Oversized Heavyweight Tee - Black - M' },
+    { sku: '', name: 'Ribbed Athletic Crew Socks - Black' },
+  ]);
+
+  // Exact, case-insensitive, against a real cell — and the model's invented SKU cannot help.
+  const { rows, missing } = await book.resolveRows([
+    { description: 'ribbed athletic crew socks - black' },
+    { description: 'made-up name', sku: 'ACC-SOC-BLK-OS' },
+  ]);
+  assert.deepEqual([...rows], [[0, 3]]);
+  assert.deepEqual(missing, ['made-up name']);
+
+  // And the whole row interface still works: draft, ask, answer.
+  await book.writeDraft('5 · Ribbed Athletic Crew Socks - Black', { row: 3, note: 'a mail' });
+  assert.equal((await readSheet(path)).getCell('C3').value, '5 · Ribbed Athletic Crew Socks - Black');
+  assert.equal(await fileWorkbook(path).readApproval(3), 'pending');
+});
+
+test('a sheet with neither a SKU nor a product-name column says so in one sentence', async () => {
+  const path = await buildWorkbook((wb) => {
+    const ws = wb.addWorksheet('Sheet1');
+    ws.addRow(['Ref', 'Qty']);
+    ws.addRow(['A-1', 10]);
+  });
+
+  await assert.rejects(fileWorkbook(path).products(), /no product column/);
+  await assert.rejects(fileWorkbook(path).resolveRows([{ description: 'anything' }]), /no product column/);
+});
+
+test('a name-only table is found even when a cover sheet comes first', async () => {
+  const path = await buildWorkbook((wb) => {
+    wb.addWorksheet('Cover').addRow(['Example GmbH', 'price list']);
+    const ws = wb.addWorksheet('Stock');
+    ws.addRow(['Artikelbezeichnung', 'Qty']);
+    ws.addRow(['Ribbed Athletic Crew Socks - Black', 5]);
+  });
+
+  assert.deepEqual(await fileWorkbook(path).products(), [
+    { sku: '', name: 'Ribbed Athletic Crew Socks - Black' },
+  ]);
+});
+
+// A workbook that does not look like the sample: these are the shapes a real SME file arrives in.
+
+test('a title row above the table does not hide the table', async () => {
+  const path = await buildWorkbook((wb) => {
+    const ws = wb.addWorksheet('Stock');
+    ws.addRow(['Bestellung 2026']);
+    ws.addRow([]);
+    ws.addRow(['SKU', 'Product Name', 'Qty']);
+    ws.addRow(['AP-TSH-BLK-M', 'Oversized Heavyweight Tee - Black - M', 10]);
+    ws.addRow(['ACC-SOC-BLK-OS', 'Ribbed Athletic Crew Socks - Black', 5]);
+  });
+  const book = fileWorkbook(path);
+
+  assert.deepEqual(await book.products(), [
+    { sku: 'AP-TSH-BLK-M', name: 'Oversized Heavyweight Tee - Black - M' },
+    { sku: 'ACC-SOC-BLK-OS', name: 'Ribbed Athletic Crew Socks - Black' },
+  ]);
+  assert.equal((await book.resolveRows([{ description: 'ribbed athletic crew socks - black' }])).rows.get(0), 5);
+
+  await book.writeDraft('30', { row: 5 });
+  const sheet = await readSheet(path);
+  assert.equal(sheet.getCell('A1').value, 'Bestellung 2026', 'the title is untouched');
+  assert.equal(sheet.getCell('D3').value, 'AI suggests', 'the column header sits with the table header');
+  assert.equal(sheet.getCell('D5').value, '30');
+  assert.equal(sheet.getCell('E5').dataValidation?.type, 'list');
+  assert.equal(sheet.getCell('D5').value, '30');
+  assert.equal((await book.readApproval(5)), 'pending');
+});
+
+test('the orders sheet need not be the first one', async () => {
+  const path = await buildWorkbook((wb) => {
+    wb.addWorksheet('Cover').addRow(['Example GmbH']);
+    const ws = wb.addWorksheet('Stock');
+    ws.addRow(['SKU', 'Product Name', 'Qty']);
+    ws.addRow(['AP-TSH-BLK-M', 'Oversized Heavyweight Tee - Black - M', 10]);
+  });
+
+  assert.deepEqual(await fileWorkbook(path).products(), [
+    { sku: 'AP-TSH-BLK-M', name: 'Oversized Heavyweight Tee - Black - M' },
+  ]);
+});
+
+test('the header may be German, and a trailing colon or star is the same header', async () => {
+  const path = await buildWorkbook((wb) => {
+    const ws = wb.addWorksheet('Lager');
+    ws.addRow(['Artikelnummer*', 'Bezeichnung:', 'Bestand']);
+    ws.addRow(['AP-TSH-BLK-M', 'Oversized Heavyweight Tee - Black - M', 10]);
+  });
+
+  assert.deepEqual(await fileWorkbook(path).products(), [
+    { sku: 'AP-TSH-BLK-M', name: 'Oversized Heavyweight Tee - Black - M' },
+  ]);
+});
+
+test('a product name stored as a link or as rich text is still its text', async () => {
+  const path = await buildWorkbook((wb) => {
+    const ws = wb.addWorksheet('Sheet1');
+    ws.addRow(['SKU', 'Product Name', 'Qty']);
+    ws.getCell('A2').value = 'AP-TSH-BLK-M';
+    ws.getCell('B2').value = {
+      text: 'Oversized Heavyweight Tee - Black - M',
+      hyperlink: 'https://example.invalid/tee',
+    };
+    ws.getCell('C2').value = 10;
+    ws.getCell('A3').value = 'ACC-SOC-BLK-OS';
+    ws.getCell('B3').value = { richText: [{ text: 'Ribbed Athletic Crew Socks - Black' }] };
+    ws.getCell('C3').value = 5;
+  });
+  const book = fileWorkbook(path);
+
+  assert.deepEqual(await book.products(), [
+    { sku: 'AP-TSH-BLK-M', name: 'Oversized Heavyweight Tee - Black - M' },
+    { sku: 'ACC-SOC-BLK-OS', name: 'Ribbed Athletic Crew Socks - Black' },
+  ]);
+  assert.deepEqual(
+    [...(await book.resolveRows([{ description: 'Ribbed Athletic Crew Socks - Black' }])).rows],
+    [[0, 3]],
+  );
+});
+
+test('the AI columns land beside the table, not beside a stray note', async () => {
+  const path = await buildWorkbook((wb) => {
+    const ws = wb.addWorksheet('Sheet1');
+    ws.addRow(['SKU', 'Product Name', 'Qty']);
+    ws.addRow(['AP-TSH-BLK-M', 'Oversized Heavyweight Tee - Black - M', 10]);
+    ws.getCell('ZZ1').value = 'scratch';
+  });
+
+  await fileWorkbook(path).writeDraft('30', { row: 2 });
+
+  const sheet = await readSheet(path);
+  assert.equal(sheet.getCell('D1').value, 'AI suggests');
+  assert.equal(sheet.getCell('E1').value, 'Your answer: OK or no');
+  assert.equal(sheet.getCell('F1').value, 'AI result');
+  assert.equal(sheet.getCell('D2').value, '30');
+  assert.equal(sheet.getCell('ZZ1').value, 'scratch', 'the stray cell is untouched');
+});
+
+test('a workbook that already has its own Log sheet keeps it', async () => {
+  const path = await buildWorkbook((wb) => {
+    const ws = wb.addWorksheet('Sheet1');
+    ws.addRow(['SKU', 'Product Name', 'Qty']);
+    ws.addRow(['AP-TSH-BLK-M', 'Oversized Heavyweight Tee - Black - M', 10]);
+    wb.addWorksheet('Log').addRow(['my own notes']);
+  });
+  const book = fileWorkbook(path);
+
+  await book.appendLog([
+    { when: '2026-10-30 09:00', mail: '<m@x>', did: 'row 2 · AP-TSH-BLK-M · 30', answer: 'OK', result: 'recorded ✓' },
+  ]);
+
+  const theirs = await readSheetNamed(path, 'Log');
+  assert.deepEqual(rowValues(theirs!.getRow(1)).slice(1), ['my own notes'], 'their sheet is not ours to write in');
+
+  const ours = await readSheetNamed(path, 'Log (sheetflow)');
+  assert.deepEqual(rowValues(ours!.getRow(1)).slice(1), [
+    'When (UTC)',
+    'Mail',
+    'What the AI did',
+    'Your answer',
+    'Result',
+  ]);
+  assert.deepEqual(rowValues(ours!.getRow(2)).slice(1), [
+    '2026-10-30 09:00',
+    '<m@x>',
+    'row 2 · AP-TSH-BLK-M · 30',
+    'OK',
+    'recorded ✓',
+  ]);
+
+  // Idempotent: a second pass appends to the same sheet instead of creating another one.
+  await book.appendLog([{ when: '2026-10-30 09:05', mail: '<n@x>', did: 'row 2', answer: 'no', result: 'cleared' }]);
+  const again = await readSheetNamed(path, 'Log (sheetflow)');
+  assert.equal(again!.rowCount, 3);
+});
+
+test('a cell reads as text whatever shape Excel stored it in', () => {
+  assert.equal(cellTextValue('  x  '), 'x');
+  assert.equal(cellTextValue(12), '12');
+  assert.equal(cellTextValue(null), '');
+  assert.equal(cellTextValue({ text: 'Tee', hyperlink: 'https://example.invalid' }), 'Tee');
+  assert.equal(cellTextValue({ richText: [{ text: 'Ri' }, { text: 'bbed' }] }), 'Ribbed');
+  assert.equal(cellTextValue({ formula: 'A1&B1', result: 'Tee' }), 'Tee');
+  assert.equal(cellTextValue({ formula: 'A1&B1' }), '', 'a formula with no cached result has no text');
 });
 
 test('a locked workbook is recognised as such, and nothing else is', () => {

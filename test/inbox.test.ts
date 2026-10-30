@@ -9,7 +9,7 @@ import { Mastra } from '@mastra/core';
 import { InMemoryStore } from '@mastra/core/storage';
 import { buildWorkflow } from '../src/workflow.js';
 import { resolveProfile, type Extraction } from '../src/model.js';
-import { openDb, getRun, type Db } from '../src/db.js';
+import { openDb, getRun, pendingNotices, type Db } from '../src/db.js';
 import { pollInbox, forget, forgetWaiting } from '../src/inbox.js';
 import type { Mail, Mailbox } from '../src/mail.js';
 import type { Workbook } from '../src/excel.js';
@@ -68,7 +68,7 @@ test('a run left undecided by an earlier pass does not hold up new mail', async 
   const outcomes = await pass([second], 600_000);
 
   assert.ok(Date.now() - startedAt < 5_000, 'the pass did not sit on the old run');
-  assert.equal(drafts.get(6), '12');
+  assert.equal(drafts.get(6), '12 · brass fitting');
   assert.equal(outcomes.find((outcome) => outcome.messageId === second.messageId)?.action, 'approved');
   assert.equal(outcomes.find((outcome) => outcome.messageId === MAIL.messageId)?.action, 'pending');
 });
@@ -282,7 +282,7 @@ test('a pass still runs when the workbook cannot be refreshed because Excel has 
   const outcomes = await pass({ pollMs: 1, timeoutMs: 5_000 });
 
   assert.equal(outcomes[0].action, 'approved', 'reads and decisions still work while the file is open');
-  assert.equal(drafts.get(4), '30');
+  assert.equal(drafts.get(4), '30 · steel bracket');
 });
 
 test('a workbook held open in Excel defers the mail instead of burning it', async () => {
@@ -299,6 +299,71 @@ test('a workbook held open in Excel defers the mail instead of burning it', asyn
 
   assert.equal(outcomes[0].action, 'deferred');
   assert.equal(getRun(db, MAIL.messageId), undefined, 'the ledger row is gone, so the next pass retries');
+});
+
+test('what an open workbook blocked still reaches the sheet, once it is free', async () => {
+  const db = openDb(':memory:');
+  const { book } = fakeBook(undefined, { locked: true });
+  book.ensureInterface = async () => {
+    throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' });
+  };
+  const workflow = buildWorkflow({
+    mastra: new Mastra({ storage: new InMemoryStore() }),
+    book,
+    extract: async () => EXTRACTION,
+    provider: resolveProfile('openai'),
+  });
+
+  await pollInbox({ db, book, workflow, mailbox: fakeMailbox(), pollMs: 1, timeoutMs: 5 });
+
+  // Nothing could be written while Excel held the file — not even the explanation.
+  assert.deepEqual(
+    pendingNotices(db).map((row) => row.result),
+    ['close Excel and it will appear', 'retried automatically'],
+    'both the missing interface and the mail it blocked are queued',
+  );
+
+  // Excel is closed: the next pass puts both lines in the Log, in words the owner can act on.
+  const { book: freeBook, log } = fakeBook();
+  await pollInbox({ db, book: freeBook, workflow, mailbox: fakeMailbox([]), pollMs: 1, timeoutMs: 5 });
+
+  assert.deepEqual(log.map((entry) => entry.result), [
+    'close Excel and it will appear',
+    'retried automatically',
+  ]);
+  assert.match(log[1].mail, /orders@acer\.example/, 'the line names the mail, not a Message-ID');
+  assert.match(log[1].did, /was open in Excel/);
+
+  // Said once. A file left open all afternoon must not fill the sheet with the same sentence.
+  const { book: thirdBook, log: thirdLog } = fakeBook();
+  await pollInbox({ db, book: thirdBook, workflow, mailbox: fakeMailbox([]), pollMs: 1, timeoutMs: 5 });
+  assert.deepEqual(thirdLog, []);
+  assert.equal(pendingNotices(db).length, 0);
+});
+
+test('a mail the model could not read is recorded where the owner looks', async () => {
+  const db = openDb(':memory:');
+  const { book, log } = fakeBook();
+  const workflow = buildWorkflow({
+    mastra: new Mastra({ storage: new InMemoryStore() }),
+    book,
+    extract: async () => {
+      throw new Error('schema: lines is required');
+    },
+    provider: resolveProfile('openai'),
+  });
+
+  const outcomes = await pollInbox({ db, book, workflow, mailbox: fakeMailbox(), pollMs: 1, timeoutMs: 5 });
+
+  assert.equal(outcomes[0].action, 'failed');
+  // The workbook was writable, so it lands in the same pass — no terminal to read.
+  assert.deepEqual(log.map((entry) => entry.result), ['not drafted']);
+  assert.match(log[0].did, /needs a person/, 'the sheet says what to do, not what threw');
+  const runId = getRun(db, MAIL.messageId)!.id;
+  assert.ok(
+    auditLines(db, runId).some((line) => /lines is required/.test(line)),
+    'the technical reason is still in the audit trail',
+  );
 });
 
 test('waiting survives the sheet being unreadable mid-poll', async () => {
@@ -454,7 +519,44 @@ test('an extraction failure marks the run failed without waiting for a human', a
   assert.equal(outcomes[0].action, 'failed');
   const run = getRun(db, MAIL.messageId)!;
   assert.equal(run.status, 'failed');
-  assert.deepEqual(auditLines(db, run.id), ['pipeline:start-failed']);
+  const lines = auditLines(db, run.id);
+  assert.equal(lines[0], 'pipeline:start-failed');
+  assert.match(
+    lines[1],
+    /^pipeline:start-error: .*could not parse/,
+    'the reason is kept for whoever has to debug it — the sheet only says "needs a person"',
+  );
+});
+
+test('a workbook that is not a stock table is reported once, as a workbook problem', async () => {
+  const db = openDb(':memory:');
+  const { book, log } = fakeBook();
+  // What the real client throws when neither a SKU nor a product-name column exists.
+  book.products = async () => {
+    throw Object.assign(new Error('stock.xlsx has no product column.'), { name: 'WorkbookShapeError' });
+  };
+  const workflow = buildWorkflow({
+    mastra: new Mastra({ storage: new InMemoryStore() }),
+    book,
+    extract: async () => EXTRACTION,
+    provider: resolveProfile('openai'),
+  });
+
+  const second = { ...MAIL, messageId: '<inbox-2@acer.example>' };
+  const outcomes = await pollInbox({
+    db,
+    book,
+    workflow,
+    mailbox: fakeMailbox([MAIL, second]),
+    pollMs: 1,
+    timeoutMs: 5,
+  });
+
+  assert.deepEqual(outcomes.map((o) => o.action), ['failed', 'failed']);
+  // Two mails, one line: the fix is the sheet, not the mail.
+  assert.deepEqual(log.map((entry) => entry.result), ['fix the workbook']);
+  assert.match(log[0].did, /has no product column/);
+  assert.equal(log[0].mail, '(sheetflow itself)');
 });
 
 test('a mail that is not a purchase is recorded as ignored and writes nothing', async () => {
@@ -520,7 +622,7 @@ test('a rejection is written to the log, so the cleared draft leaves a history',
   assert.equal(drafts.has(4), false, 'the working cell is cleared');
   assert.deepEqual(
     log.map(({ did, answer, result }) => ({ did, answer, result })),
-    [{ did: 'row 4 · steel bracket · 30', answer: 'no', result: 'cleared' }],
+    [{ did: 'row 4 · 30 · steel bracket', answer: 'no', result: 'cleared' }],
     'the log is the only place the history survives',
   );
 });

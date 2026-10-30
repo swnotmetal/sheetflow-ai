@@ -24,6 +24,13 @@ exists to protect. A change that breaks one of them is a regression even if ever
 High-volume, low-to-mid-ticket, repeatable orders — cheap, bulky, "same thing every week". Not every
 deal, and not for high-touch or high-ticket sales.
 
+**One editor, one local file.** The local `.xlsx` direction assumes the workbook has a single owner
+and does **not** solve concurrent editing: if a colleague works in the same file they keep their own
+numbering and colouring and stay out of the AI's three columns. That is a stated limit, not a gap to
+close — a local file cannot reconcile two writers, and building for it would cost the simplicity
+that makes the direction worth doing. A shared Google Sheet has no such problem, which is why
+`src/sheets.ts` exists rather than a lock protocol for a file.
+
 ## Model access
 
 One provider per run, chosen by `LLM_PROFILE` (`aws` · `openai` · `anthropic` · `groq` · `deepseek` ·

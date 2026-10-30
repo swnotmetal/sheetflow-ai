@@ -26,7 +26,37 @@ const TriggerSchema = z.object({
   from: z.string().default(''),
   subject: z.string().default(''),
   body: z.string(),
+  receivedAt: z.string().default(''),
 });
+
+/**
+ * Which mail asked for this, in the words a shop owner recognizes. It travels with the draft so the
+ * suggestion in the sheet can say where it came from: "30 pcs" alone cannot be aligned with a
+ * mailbox, and a Message-ID is not an answer to "which mail is this row about?".
+ */
+export const MailIdentity = z.object({
+  from: z.string().default(''),
+  subject: z.string().default(''),
+  receivedAt: z.string().default(''),
+});
+export type MailIdentity = z.infer<typeof MailIdentity>;
+
+export const EMPTY_MAIL: MailIdentity = { from: '', subject: '', receivedAt: '' };
+
+/**
+ * The same identity as one line: when (UTC), who, and the subject. One line because it lands in a
+ * `Log` cell, where a newline does not grow the row; Excel wraps the note for the same string.
+ */
+export function mailSource(mail: MailIdentity): string {
+  const at = new Date(mail.receivedAt);
+  const when = Number.isNaN(at.getTime())
+    ? ''
+    : `${at.toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+  const line = [when, mail.from.trim()].filter(Boolean).join(' · ');
+  const subject = mail.subject.trim();
+  if (!subject) return line;
+  return line ? `${line} — "${subject}"` : `"${subject}"`;
+}
 
 /** One human answer, as data. The sheet collects it; the driver hands it back through `resume`.
  * The shape follows the frameworks' own examples (LangGraph `Command(resume=...)`, Mastra
@@ -53,6 +83,8 @@ const LineSchema = z.object({
 
 const ExtractOutput = z.object({
   messageId: z.string(),
+  /** Which mail this is — carried through so the sheet can show it. */
+  mail: MailIdentity,
   /** What the mail is. Only an `order` is allowed to reach the sheet. */
   intent: z.enum(INTENTS),
   /** Grounded lines only — anything the model invented was already dropped. */
@@ -74,6 +106,7 @@ const DraftRowSchema = z.object({
 
 const DraftOutput = z.object({
   messageId: z.string(),
+  mail: MailIdentity,
   intent: z.enum(INTENTS),
   /** What the model called it. Kept so a disagreement with the rule below stays visible. */
   modelIntent: z.enum(INTENTS),
@@ -109,10 +142,14 @@ export function decideIntent(modelIntent: Intent, lines: { quantity?: string | n
   return modelIntent === 'other' ? 'other' : 'question';
 }
 
-/** What a human reads in the sheet before deciding: quantity + unit + what the mail named. */
+/** What a human reads in the sheet before deciding: how much, then what the mail itself called it. */
 export function formatDraft(lines: z.infer<typeof LineSchema>[]): string {
   return lines
-    .map((line) => [line.quantity, line.unit, line.description].filter(Boolean).join(' '))
+    .map((line) => {
+      // `?` is not a guess: the mail named the item without a quantity, and the human types one.
+      const amount = [line.quantity?.trim(), line.unit?.trim()].filter(Boolean).join(' ') || '?';
+      return [amount, line.description.trim()].filter(Boolean).join(' · ');
+    })
     .join('; ');
 }
 
@@ -156,6 +193,7 @@ export function buildWorkflow(deps: WorkflowDeps = {}) {
 
       return {
         messageId: inputData.messageId,
+        mail: { from: inputData.from, subject: inputData.subject, receivedAt: inputData.receivedAt },
         intent,
         lines: kept.lines ?? [],
         dropped: dropped.length,
@@ -170,6 +208,8 @@ export function buildWorkflow(deps: WorkflowDeps = {}) {
     outputSchema: DraftOutput,
     execute: async ({ inputData }) => {
       const intent = decideIntent(inputData.intent, inputData.lines);
+      // One note for every row this mail touches: who wrote, when, and what it was called.
+      const note = mailSource(inputData.mail);
 
       // Not a purchase at all: nothing is drafted, and nothing waits for a human. A recruitment
       // pitch has no business writing into a stock sheet. A *question* is different — the sender
@@ -177,6 +217,7 @@ export function buildWorkflow(deps: WorkflowDeps = {}) {
       if (intent === 'other') {
         return {
           messageId: inputData.messageId,
+          mail: inputData.mail,
           intent,
           modelIntent: inputData.intent,
           model: inputData.model,
@@ -198,9 +239,8 @@ export function buildWorkflow(deps: WorkflowDeps = {}) {
       inputData.lines.forEach((line, at) => {
         const row = rows.get(at);
         if (!row) return;
-        // No quantity in the mail means no quantity is written. `?` is the honest placeholder:
-        // the human types the number (or `no`) in the answer column.
-        const value = [line.quantity?.trim(), line.unit?.trim()].filter(Boolean).join(' ') || '?';
+        // What the mail itself said, so the human compares the two in one cell instead of two windows.
+        const value = formatDraft([line]);
         const existing = drafts.get(row);
         // Two lines for one SKU stay visible as two proposals; summing quantities would invent a
         // number the mail never stated.
@@ -212,12 +252,13 @@ export function buildWorkflow(deps: WorkflowDeps = {}) {
 
       const written: z.infer<typeof DraftRowSchema>[] = [];
       for (const [row, { matched, draft }] of drafts) {
-        await book.writeDraft(draft, { row });
+        await book.writeDraft(draft, { row, note });
         written.push({ row, matched, draft });
       }
 
       return {
         messageId: inputData.messageId,
+        mail: inputData.mail,
         intent,
         modelIntent: inputData.intent,
         model: inputData.model,
@@ -236,6 +277,7 @@ export function buildWorkflow(deps: WorkflowDeps = {}) {
     // What we hand to the human, and what they hand back: one answer per row they touched.
     suspendSchema: z.object({
       messageId: z.string(),
+      mail: MailIdentity,
       intent: z.enum(INTENTS),
       modelIntent: z.enum(INTENTS),
       rows: z.array(DraftRowSchema),
@@ -249,6 +291,7 @@ export function buildWorkflow(deps: WorkflowDeps = {}) {
         return suspend(
           {
             messageId: inputData.messageId,
+            mail: inputData.mail,
             intent: inputData.intent,
             modelIntent: inputData.modelIntent,
             rows: inputData.rows,

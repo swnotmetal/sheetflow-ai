@@ -42,6 +42,7 @@ const first = await run.start({
     from: mail.from,
     subject: mail.subject,
     body: mail.body,
+    receivedAt: mail.receivedAt,
   },
 });
 
